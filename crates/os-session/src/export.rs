@@ -880,6 +880,70 @@ mod tests {
     }
 }
 
+/// The mixer tracks a render of the tracks writes (`start_tracks`): those the rack's channels play into, and the tracks
+/// they route to, the master left out; in track order.
+pub fn tracks_in_use(ses: &crate::session::Session) -> Vec<u16> {
+    let p = &ses.project;
+    let mut used: Vec<u16> = p.channels.iter().map(|c| c.mixer_track).filter(|&t| t > 0).collect();
+    let mut i = 0;
+    while i < used.len() {
+        if let Some(m) = p.mixer.iter().find(|m| m.index == used[i]) {
+            for &r in &m.routes {
+                if r > 0 && !used.contains(&r) {
+                    used.push(r);
+                }
+            }
+        }
+        i += 1;
+    }
+    used.sort_unstable();
+    used.dedup();
+    used
+}
+
+/// The control plane's render of the mixer tracks (`render_tracks`): each of `tracks` (else `tracks_in_use`) alone, the
+/// whole song from its start, as a 32-bit float WAV in `folder` named "<name> - <NN> <track name>" (one track: "<name>"),
+/// at the output device's rate (44.1 kHz without one). Every file is as long as the song with its ring-out, so they
+/// line up. It runs as an export does; follow it with `poll`, which keeps the outcome in `Control::rendered`.
+pub fn start_tracks(ses: &mut crate::session::Session, folder: PathBuf, name: String, tracks: Option<Vec<u16>>) -> Result<Vec<u16>, String> {
+    if ses.export.is_some() {
+        return Err("an export is running".into());
+    }
+    let top = crate::edit::mixer::inserts(ses);
+    let tracks = match tracks {
+        Some(t) => t,
+        None => tracks_in_use(ses),
+    };
+    if tracks.is_empty() {
+        return Err("no mixer track to render: the channels all play into the master".into());
+    }
+    if let Some(t) = tracks.iter().find(|&&t| t == 0 || t > top) {
+        return Err(format!("no insert track {t} (1..={top})"));
+    }
+    std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let options = Options { formats: [true, false, false, false], wav_depth: 2, split: true, split_master: false, markers: false, loops: false, note_markers: false, tempo: false, reveal: false, ..Options::default() };
+    let tempo = ses.project.tick_tempo(ses.tempo());
+    let job = Job {
+        options,
+        folder,
+        name: name.clone(),
+        span: None,
+        markers: Vec::new(),
+        loop_frames: None,
+        tempo: (tempo, 0.0),
+        track_names: (0..=top).map(|t| crate::edit::mixer::name(ses, t)).collect(),
+        tracks: tracks.clone(),
+    };
+    let project = crate::edit::rack::play_project_in(ses);
+    let rate = crate::transport::Transport::device_rate().unwrap_or(44100);
+    ses.plugins.set_offline(true);
+    lemon_sampler::stream::export_started();
+    ses.control.rendered = None;
+    ses.transport.export(&project, os_engine::PlayMode::Song, rate, job);
+    ses.export = Some((name, 0.0));
+    Ok(tracks)
+}
+
 /// What the running export did since the last look (`poll`).
 pub enum Polled {
     Idle,
@@ -904,8 +968,51 @@ pub fn poll(ses: &mut crate::session::Session) -> Polled {
             }
             ses.plugins.set_offline(false);
             lemon_sampler::stream::export_finished();
+            ses.control.rendered = Some(r.clone());
             Polled::Done(name, r)
         }
         crate::transport::Export::Idle => Polled::Idle,
+    }
+}
+
+#[cfg(test)]
+mod render_tracks_tests {
+    /// The control plane's `render_tracks` (MixLab Studio's import of the mixer tracks): each insert the channels play
+    /// into, alone, as a WAV file in the folder, the master left out and every file the same length; `render_status`
+    /// hands out the files. A client that may not write files (a window is open) leaves it to the user instead.
+    #[test]
+    fn the_control_plane_renders_the_tracks() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("lemon-render-tracks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ses = crate::session::Session::new(crate::projects::test_project(), crate::transport::Transport::new(None), crate::settings_file::SettingsStore::memory());
+        let mut asks = crate::control::rpc::Asks::default();
+        let mut c = crate::control::rpc::Client { name: "MixLab".into(), level: crate::control::Level::Edit, saves: false, token: None };
+        let call = |ses: &mut crate::session::Session, c: &mut crate::control::rpc::Client, asks: &mut crate::control::rpc::Asks, m: &str, p: serde_json::Value| {
+            crate::control::rpc::rpc_in(ses, c, m, &p, 0, asks).ok().unwrap_or_else(|| panic!("{m} failed"))
+        };
+        let r = call(&mut ses, &mut c, &mut asks, "render_tracks", json!({ "folder": dir.display().to_string(), "name": "Song" }));
+        assert!(r.get("asked").is_some() && asks.render.is_some() && ses.export.is_none(), "with a window, the user decides: {r}");
+        c.saves = true;
+        let r = call(&mut ses, &mut c, &mut asks, "render_tracks", json!({ "folder": dir.display().to_string(), "name": "Song" }));
+        assert_eq!(r["tracks"], json!([1, 2, 3, 4, 5]), "the five channels' inserts, not the master");
+        let t0 = std::time::Instant::now();
+        let done = loop {
+            let s = call(&mut ses, &mut c, &mut asks, "render_status", json!({}));
+            match s["status"].as_str() {
+                Some("done") => break s,
+                Some("failed") => panic!("render failed: {s}"),
+                _ if t0.elapsed() > std::time::Duration::from_secs(60) => panic!("render did not finish: {s}"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        let files: Vec<String> = serde_json::from_value(done["files"].clone()).unwrap();
+        assert_eq!(files.len(), 5, "{files:?}");
+        let sizes: Vec<u64> = files.iter().map(|f| std::fs::metadata(f).expect("written").len()).collect();
+        assert!(sizes.iter().all(|&n| n == sizes[0] && n > 44), "same length: {sizes:?}");
+        assert!(files.iter().all(|f| f.starts_with(&dir.display().to_string()) && f.contains("Song - 0") && f.ends_with(".wav")), "{files:?}");
+        assert!(!dir.join("Song.wav").exists(), "no mix");
+        assert_eq!(call(&mut ses, &mut c, &mut asks, "render_status", json!({}))["status"], "done", "the result stays readable");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

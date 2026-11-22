@@ -116,6 +116,8 @@ pub enum Then {
     Proposal(u64),
     /// A control-plane client asks to save the project to this file: Yes saves it.
     ClientSave(PathBuf),
+    /// A client's render of the mixer tracks: the folder, the files' name, the tracks (`None`: those in use).
+    ClientRender(PathBuf, String, Option<Vec<u16>>),
     /// The MIDI file to import (`crate::midi_file`); true: from the piano roll.
     MidiImport(bool),
     /// Where to export a MIDI file; true: the piano roll's channel.

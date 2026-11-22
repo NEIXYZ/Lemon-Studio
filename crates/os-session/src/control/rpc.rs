@@ -20,6 +20,8 @@
 //! | `accept`, `discard` | `proposal` | edit | the commands' results; nothing |
 //! | `undo`, `redo` | | edit | the step undone or redone |
 //! | `save` | `path` (else the project's file) | edit | where it was saved; with a window the user is asked instead |
+//! | `render_tracks` | `folder`, `name`, `tracks` (optional) | edit | the tracks rendering; with a window the user is asked instead |
+//! | `render_status` | | read | the render's progress, then its files or why it failed |
 //!
 //! A client that proposes waits for the user: the app asks them (`App::ask_proposal`).
 
@@ -86,6 +88,8 @@ fn commands(params: &Value) -> Result<Vec<Command>, Fail> {
 pub struct Asks {
     pub proposal: Option<u64>,
     pub save: Option<(String, std::path::PathBuf)>,
+    /// A client's render of the mixer tracks: who asks, the folder, the files' name, the tracks (`None`: those in use).
+    pub render: Option<(String, std::path::PathBuf, String, Option<Vec<u16>>)>,
 }
 
 /// Answers one request line from client `c` (`None`: a notification, no answer).
@@ -230,6 +234,38 @@ pub fn rpc_in(ses: &mut Session, c: &mut Client, m: &str, params: &Value, select
                 asks.save = Some((c.name.clone(), path.clone()));
                 Ok(json!({ "asked": path.display().to_string() }))
             }
+        }
+        // Each mixer track alone as a WAV file (the stems a mixing app imports). Writing files is an effect outside the
+        // project: with a window, the user decides, as for `save`.
+        "render_tracks" => {
+            need(c, Level::Edit)?;
+            let folder = params.get("folder").and_then(Value::as_str).filter(|f| !f.trim().is_empty()).map(std::path::PathBuf::from).ok_or_else(|| bad("`folder` is missing"))?;
+            let name = params.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Tracks").to_string();
+            let tracks = match params.get("tracks") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(serde_json::from_value::<Vec<u16>>(v.clone()).map_err(|e| bad(format!("`tracks`: {e}")))?),
+            };
+            if ses.export.is_some() {
+                return Err(failed("an export is running"));
+            }
+            if c.saves {
+                let tracks = crate::export::start_tracks(ses, folder.clone(), name, tracks).map_err(failed)?;
+                Ok(json!({ "started": folder.display().to_string(), "tracks": tracks }))
+            } else {
+                asks.render = Some((c.name.clone(), folder.clone(), name, tracks));
+                Ok(json!({ "asked": folder.display().to_string() }))
+            }
+        }
+        "render_status" => {
+            if ses.export.is_some() {
+                let _ = crate::export::poll(ses);
+            }
+            Ok(match (&ses.export, &ses.control.rendered) {
+                (Some((_, p)), _) => json!({ "status": "running", "progress": p }),
+                (None, Some(Ok((secs, files)))) => json!({ "status": "done", "seconds": secs, "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>() }),
+                (None, Some(Err(e))) => json!({ "status": "failed", "message": e }),
+                (None, None) => json!({ "status": "idle" }),
+            })
         }
         _ => Err(Fail(NO_METHOD, format!("no method `{m}`"))),
     };
