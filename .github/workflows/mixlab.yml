@@ -1,0 +1,94 @@
+# Builds Lemon Studio for MixLab Studio, which bundles it in its installers and updates it from here.
+# One release per commit of main, named mixlab-<commit>, marked as GitHub's "latest" release. Each release holds:
+#   LemonStudio-windows-x86_64.exe, LemonStudio-macos-aarch64.zip, LemonStudio-macos-x86_64.zip (the .app, zipped),
+#   mixlab.json (the version and commit), LICENSE and THIRD-PARTY-NOTICES.txt.
+# These builds carry no updater (no LEMON_UPDATER, no LEMON_CHANNEL): MixLab Studio updates them, so they never
+# replace themselves with a build that lacks this fork's additions.
+
+name: Lemon for MixLab
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mixlab
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            platform: windows-x86_64
+          - name: macOS (Apple silicon)
+            os: macos-latest
+            platform: macos-aarch64
+          - name: macOS (Intel)
+            os: macos-15-intel
+            platform: macos-x86_64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mixlab
+      - name: Build Lemon Studio
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = macOS ]; then cargo run --release --locked -p bundle-app; else cargo build --release --locked -p lemonstudio; fi
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/lemonstudio.exe "dist/LemonStudio-${{ matrix.platform }}.exe"
+          else
+            ditto -c -k --keepParent "target/bundled/Lemon Studio.app" "dist/LemonStudio-${{ matrix.platform }}.zip"
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          sha=${GITHUB_SHA::8}
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          cp LICENSE THIRD-PARTY-NOTICES.txt dist/
+          printf '{"version":"%s+%s","commit":"%s","source":"https://github.com/%s/tree/%s"}\n' \
+            "$version" "$sha" "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_SHA" > dist/mixlab.json
+          gh release delete "mixlab-$sha" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "mixlab-$sha" dist/* --target "$GITHUB_SHA" --latest \
+            --title "Lemon Studio for MixLab $version+$sha" \
+            --notes "Lemon Studio built from $GITHUB_SHA for MixLab Studio: the control plane renders the mixer tracks (render_tracks) and the MixLab theme is built in. GPL-3.0-or-later; sources: https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA"
