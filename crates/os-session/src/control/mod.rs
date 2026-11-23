@@ -130,6 +130,9 @@ pub struct Control {
     seen: Option<(os_model::Project, f64)>,
     /// A client may be connected (the app listens, `--control` / `--serve`): edits in the interface become events.
     pub watched: bool,
+    /// The last export's outcome (its length in seconds and the files written, or why it failed), kept for
+    /// `render_status` after the interface took it (`export::poll`).
+    pub rendered: Option<Result<(f64, Vec<std::path::PathBuf>), String>>,
     /// How many things the project had at the last `settle` (`settle_tick`).
     counted: [usize; 11],
     /// Clients' gestures under way (`begin_in`): their number and the name of their step.

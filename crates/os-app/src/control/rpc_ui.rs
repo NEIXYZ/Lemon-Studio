@@ -41,6 +41,9 @@ impl App {
         if let Some((who, path)) = asks.save {
             self.ask_save(&who, path);
         }
+        if let Some((who, folder, name, tracks)) = asks.render {
+            self.ask_render(&who, folder, name, tracks);
+        }
     }
 }
 
@@ -51,6 +54,15 @@ impl App {
         let text = vec![(who.to_string(), true), (" asks to save the project to ".into(), false), (path.display().to_string(), true), (".".into(), false)];
         let mut msg = Msg::new(Kind::Warning, "Save", text, &[Answer::Yes, Answer::No], Then::ClientSave(path));
         msg.labels = vec!["Save", "Don't save"];
+        self.show_msg(msg);
+    }
+
+    /// Asks the user whether client `who` may write the mixer tracks, each alone, as WAV files into `folder`.
+    pub fn ask_render(&mut self, who: &str, folder: std::path::PathBuf, name: String, tracks: Option<Vec<u16>>) {
+        use crate::dialog::{Answer, Kind, Msg, Then};
+        let text = vec![(who.to_string(), true), (" asks to render the mixer tracks, each alone, as WAV files into ".into(), false), (folder.display().to_string(), true), (".".into(), false)];
+        let mut msg = Msg::new(Kind::Info, "Render tracks", text, &[Answer::Yes, Answer::No], Then::ClientRender(folder, name, tracks));
+        msg.labels = vec!["Render", "Don't render"];
         self.show_msg(msg);
     }
 

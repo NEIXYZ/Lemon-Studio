@@ -2327,6 +2327,14 @@ impl App {
                     self.save_to(p);
                 }
             }
+            Then::ClientRender(folder, name, tracks) => {
+                if reply == Reply::Button(Answer::Yes) {
+                    if let Err(e) = crate::export::start_tracks(&mut self.state.session, folder, name, tracks) {
+                        self.state.message = Some(format!("Render failed: {e}"));
+                    }
+                    self.invalidate();
+                }
+            }
             Then::Proposal(n) => {
                 let s = &mut self.state;
                 let r = if reply == Reply::Button(Answer::Yes) { crate::control_ui::accept(s, n).map(|_| ()) } else { crate::control::discard(&mut s.session, n) };
